@@ -1,63 +1,319 @@
-name: Kernel Build
+name: Build WSL2 Kernel with Android Support
 
 on:
-  workflow_dispatch:
   push:
-  schedule:
-    - cron: '30 5 * * 1'
+    branches: [ main, develop ]
+    paths:
+      - 'kernel/**'
+      - '.github/workflows/build-wsl-kernel.yml'
+  pull_request:
+    branches: [ main ]
+    paths:
+      - 'kernel/**'
+      - '.github/workflows/build-wsl-kernel.yml'
+  workflow_dispatch:
+    inputs:
+      kernel_version:
+        description: 'WSL2 Kernel version to build'
+        required: false
+        default: 'latest'
+      android_version:
+        description: 'Android API level support'
+        required: false
+        default: '33'
+
+env:
+  KERNEL_VERSION: ${{ github.event.inputs.kernel_version || 'latest' }}
+  ANDROID_API: ${{ github.event.inputs.android_version || '33' }}
 
 jobs:
-
-  build:
+  build-kernel:
+    runs-on: ubuntu-22.04
     strategy:
       matrix:
-        branch: ['linux-msft-wsl-5.15.y']
-    runs-on: ubuntu-latest
+        arch: [x86_64]
+    
     steps:
-
-    - name: Checkout WSL2 Kernel Builder
-      uses: actions/checkout@v4
-
-    - name: Checkout WSL2 Kernel Repo
+    - name: Checkout repository
       uses: actions/checkout@v4
       with:
-        repository: 'microsoft/WSL2-Linux-Kernel'
-        ref: ${{ matrix.branch }}
-        path: 'kernel-${{ matrix.branch }}'
+        submodules: recursive
+        fetch-depth: 0
 
-    - name: Install Toolchain
+    - name: Set up build environment
       run: |
-        sudo apt update
-        sudo apt install build-essential flex bison libssl-dev libelf-dev libncurses-dev autoconf libudev-dev libtool
+        sudo apt-get update
+        sudo apt-get install -y \
+          build-essential \
+          flex \
+          bison \
+          dwarves \
+          libssl-dev \
+          libelf-dev \
+          libudev-dev \
+          libpci-dev \
+          libiberty-dev \
+          autoconf \
+          llvm \
+          bc \
+          rsync \
+          kmod \
+          cpio \
+          git \
+          wget \
+          curl \
+          python3-pip \
+          pahole
 
-    - name: Get Default Config
-      working-directory: ./kernel-${{ matrix.branch }}
-      run: cp Microsoft/config-wsl ./.config
-
-    - name: Apply USB Config # for 5.4. branch only
-      if: ${{ matrix.branch == 'linux-msft-wsl-5.4.y' }}
-      working-directory: ./kernel-${{ matrix.branch }}
-      run: scripts/kconfig/merge_config.sh -m -y .config ../waydroid.config
-
-    - name: Apply Waydroid Config # for Waydroid config
-      working-directory: ./kernel-${{ matrix.branch }}
-      run: scripts/kconfig/merge_config.sh -m -y .config ../usb.config
-
-    - name: Apply CAN Config
-      working-directory: ./kernel-${{ matrix.branch }}
+    - name: Get WSL2 kernel source
       run: |
-        sed -Ei "s/(CONFIG_LOCALVERSION=\")(.*)(\")/\1-can-usbip-WSL2\3/g" .config
-        for file in ../[^usb]*.config; do scripts/kconfig/merge_config.sh -m -y .config $file ; done
-        scripts/kconfig/merge_config.sh -y .config ../can.config
+        if [ "$KERNEL_VERSION" = "latest" ]; then
+          LATEST_TAG=$(curl -s https://api.github.com/repos/microsoft/WSL2-Linux-Kernel/releases/latest | grep '"tag_name":' | sed -E 's/.*"([^"]+)".*/\1/')
+          echo "KERNEL_TAG=$LATEST_TAG" >> $GITHUB_ENV
+        else
+          echo "KERNEL_TAG=$KERNEL_VERSION" >> $GITHUB_ENV
+        fi
+        
+        git clone --depth 1 --branch $KERNEL_TAG https://github.com/microsoft/WSL2-Linux-Kernel.git kernel-source
+        cd kernel-source
+        echo "KERNEL_SOURCE_DIR=$(pwd)" >> $GITHUB_ENV
 
-    - name: Build
-      working-directory: ./kernel-${{ matrix.branch }}
+    - name: Apply Android patches
       run: |
-        make -j $(echo `nproc` + 1 | bc)
-        mv arch/x86/boot/bzImage arch/x86/boot/${{ matrix.branch }}-can-usbip-bzImage
+        cd $KERNEL_SOURCE_DIR
+        
+        # Create Android-specific config additions
+        cat >> .config-android << 'EOF'
+        # Android support configuration
+        CONFIG_ANDROID=y
+        CONFIG_ANDROID_BINDER_IPC=y
+        CONFIG_ANDROID_BINDERFS=y
+        CONFIG_ANDROID_BINDER_DEVICES="binder,hwbinder,vndbinder"
+        CONFIG_ASHMEM=y
+        CONFIG_STAGING=y
+        CONFIG_ION=y
+        CONFIG_ION_SYSTEM_HEAP=y
+        CONFIG_ION_CARVEOUT_HEAP=y
+        CONFIG_ION_CHUNK_HEAP=y
+        CONFIG_ION_CMA_HEAP=y
+        
+        # Waydroid specific requirements
+        CONFIG_PSI=y
+        CONFIG_MEMCG=y
+        CONFIG_CGROUP_FREEZER=y
+        CONFIG_CGROUP_PIDS=y
+        CONFIG_CGROUP_DEVICE=y
+        CONFIG_CPUSETS=y
+        CONFIG_PROC_PID_CPUSET=y
+        CONFIG_CGROUP_CPUACCT=y
+        CONFIG_CGROUP_SCHEDTUNE=y
+        CONFIG_RT_GROUP_SCHED=y
+        CONFIG_CFS_BANDWIDTH=y
+        CONFIG_BLK_CGROUP=y
+        CONFIG_CGROUP_WRITEBACK=y
+        CONFIG_CGROUP_NET_PRIO=y
+        CONFIG_CGROUP_NET_CLASSID=y
+        CONFIG_NETFILTER_XT_MATCH_QTAGUID=y
+        CONFIG_NETFILTER_XT_MATCH_SOCKET=y
+        CONFIG_NETFILTER_XT_MATCH_QUOTA2=y
+        CONFIG_NETFILTER_XT_MATCH_QUOTA2_LOG=y
+        CONFIG_IP_NF_MATCH_RPFILTER=y
+        CONFIG_IP6_NF_MATCH_RPFILTER=y
+        CONFIG_BRIDGE_NETFILTER=y
+        CONFIG_IP_NF_TARGET_REJECT=y
+        CONFIG_IP6_NF_TARGET_REJECT=y
+        CONFIG_NETFILTER_XT_TARGET_CHECKSUM=y
+        CONFIG_IP_NF_TARGET_MASQUERADE=y
+        CONFIG_IP6_NF_TARGET_MASQUERADE=y
+        CONFIG_NETFILTER_XT_MATCH_COMMENT=y
+        CONFIG_NETFILTER_XT_MATCH_CONNTRACK=y
+        CONFIG_NETFILTER_XT_MATCH_STATE=y
+        EOF
 
-    - name: Archive kernel
+    - name: Configure kernel
+      run: |
+        cd $KERNEL_SOURCE_DIR
+        
+        # Start with WSL2 default config
+        make KCONFIG_CONFIG=Microsoft/config-wsl defconfig
+        
+        # Merge Android support
+        ./scripts/kconfig/merge_config.sh -m .config .config-android
+        
+        # Ensure proper module support
+        ./scripts/config --enable CONFIG_MODULES
+        ./scripts/config --enable CONFIG_MODULE_UNLOAD
+        ./scripts/config --enable CONFIG_MODVERSIONS
+        
+        # Verify critical Android configs are set
+        grep -q "CONFIG_ANDROID_BINDER_IPC=y" .config || exit 1
+        grep -q "CONFIG_ANDROID_BINDERFS=y" .config || exit 1
+
+    - name: Build kernel
+      run: |
+        cd $KERNEL_SOURCE_DIR
+        
+        # Get number of CPU cores for parallel build
+        NPROC=$(nproc)
+        echo "Building with $NPROC parallel jobs"
+        
+        # Build kernel image
+        make -j$NPROC KCONFIG_CONFIG=.config
+        
+        # Build modules
+        make -j$NPROC KCONFIG_CONFIG=.config modules
+        
+        # Create modules directory
+        mkdir -p modules_output
+        make INSTALL_MOD_PATH=modules_output modules_install
+
+    - name: Package kernel
+      run: |
+        cd $KERNEL_SOURCE_DIR
+        
+        # Create kernel package directory
+        mkdir -p ../kernel-package
+        
+        # Copy kernel image
+        cp arch/x86/boot/bzImage ../kernel-package/kernel
+        
+        # Copy modules
+        cp -r modules_output/lib/modules ../kernel-package/
+        
+        # Create version info
+        echo "$KERNEL_TAG-android-$(date +%Y%m%d)" > ../kernel-package/version.txt
+        
+        # Copy config for reference
+        cp .config ../kernel-package/config-android
+        
+        # Create installation script
+        cat > ../kernel-package/install.sh << 'INSTALL_EOF'
+        #!/bin/bash
+        # WSL2 Android Kernel Installation Script
+        
+        KERNEL_DIR="$HOME/.waydroid-kernel"
+        
+        echo "Installing WSL2 Android Kernel..."
+        
+        # Create kernel directory
+        mkdir -p "$KERNEL_DIR"
+        
+        # Copy kernel
+        cp kernel "$KERNEL_DIR/"
+        cp -r modules "$KERNEL_DIR/" 2>/dev/null || true
+        cp version.txt "$KERNEL_DIR/"
+        
+        # Create .wslconfig entry
+        echo "Kernel path: $KERNEL_DIR/kernel"
+        echo ""
+        echo "Add this to your %USERPROFILE%\\.wslconfig file:"
+        echo ""
+        echo "[wsl2]"
+        echo "kernel=$KERNEL_DIR\\kernel"
+        echo ""
+        echo "Then restart WSL: wsl --shutdown"
+        INSTALL_EOF
+        
+        chmod +x ../kernel-package/install.sh
+
+    - name: Create kernel archive
+      run: |
+        cd kernel-package
+        tar -czf "../wsl2-android-kernel-$KERNEL_TAG-$(date +%Y%m%d).tar.gz" .
+        
+        # Calculate checksums
+        cd ..
+        sha256sum "wsl2-android-kernel-$KERNEL_TAG-$(date +%Y%m%d).tar.gz" > checksums.txt
+
+    - name: Upload kernel artifacts
       uses: actions/upload-artifact@v4
       with:
-        name: ${{ matrix.branch }}-can-usbip
-        path: kernel-${{ matrix.branch }}/arch/x86/boot/${{ matrix.branch }}-can-usbip-bzImage
+        name: wsl2-android-kernel-${{ env.KERNEL_TAG }}-${{ matrix.arch }}
+        path: |
+          wsl2-android-kernel-*.tar.gz
+          checksums.txt
+        retention-days: 30
+
+    - name: Create Release (on tag)
+      if: startsWith(github.ref, 'refs/tags/')
+      uses: softprops/action-gh-release@v1
+      with:
+        files: |
+          wsl2-android-kernel-*.tar.gz
+          checksums.txt
+        draft: false
+        prerelease: false
+        body: |
+          # WSL2 Kernel with Android Support
+          
+          This kernel includes Android binder support and other required modules for running Waydroid on WSL2.
+          
+          ## Installation
+          
+          1. Download and extract the kernel package
+          2. Run the `install.sh` script
+          3. Update your `.wslconfig` file as instructed
+          4. Restart WSL with `wsl --shutdown`
+          
+          ## What's Included
+          
+          - Android Binder IPC support
+          - Android Binderfs support
+          - Ashmem support
+          - ION memory allocator
+          - Required cgroup and networking features
+          
+          **Kernel Version**: ${{ env.KERNEL_TAG }}
+          **Build Date**: $(date +%Y-%m-%d)
+          **Android API Support**: Level ${{ env.ANDROID_API }}
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  test-kernel:
+    needs: build-kernel
+    runs-on: ubuntu-22.04
+    if: github.event_name == 'pull_request'
+    
+    steps:
+    - name: Download kernel artifacts
+      uses: actions/download-artifact@v4
+      with:
+        name: wsl2-android-kernel-${{ env.KERNEL_TAG }}-x86_64
+
+    - name: Test kernel package
+      run: |
+        # Extract and verify kernel package
+        tar -xzf wsl2-android-kernel-*.tar.gz
+        
+        # Verify kernel file exists and is valid
+        if [ ! -f kernel ]; then
+          echo "Error: Kernel file not found"
+          exit 1
+        fi
+        
+        # Check kernel file type
+        file kernel | grep -q "Linux kernel" || {
+          echo "Error: Invalid kernel file"
+          exit 1
+        }
+        
+        # Verify installation script
+        if [ ! -x install.sh ]; then
+          echo "Error: Installation script not found or not executable"
+          exit 1
+        fi
+        
+        # Verify version file
+        if [ ! -f version.txt ]; then
+          echo "Error: Version file not found"
+          exit 1
+        fi
+        
+        echo "✅ Kernel package validation passed"
+        echo "📦 Kernel version: $(cat version.txt)"
+        echo "📏 Kernel size: $(ls -lh kernel | awk '{print $5}')"
+
+    - name: Verify checksums
+      run: |
+        sha256sum -c checksums.txt
+        echo "✅ Checksum verification passed"
